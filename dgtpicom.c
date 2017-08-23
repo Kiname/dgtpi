@@ -31,6 +31,9 @@
 #include "dgtpicom_dgt3000.h"
 
 int ww;
+char smartBoardRXData[65536];
+unsigned short smartBoardRXHead = 0;
+unsigned short smartBoardRXTail = 0;
 
 // while loop
 void *wl(void *x) {
@@ -65,6 +68,20 @@ int main (int argc, char *argv[]) {
 
 	// get direct acces to the perhicels
 	if (dgtpicom_init()) return ERROR_MEM;
+
+	smartBoardSend("B",1);
+
+
+	while(1)
+	{
+		char r[16];
+		int l;
+		l = smartBoardRead(r,16);
+		for ( e=0; e<l; e++)
+			printf("%02x ",r[e]);
+		printf("\n");
+		usleep(100000);
+	}
 
 	// configure dgt3000 for mode 25
 	e = dgtpicom_configure();
@@ -346,9 +363,6 @@ int dgtpicom_init() {
 	*(gpio+1) &= 0xc7ffffff;
 */
 	i2cReset();
-
-	// set to I2CMaster destination adress
-	*i2cMasterA=8;
 
 	dgtRx.on=1;
 
@@ -654,7 +668,7 @@ int dgtpicom_off(char returnMode) {
 // Disable the I2C hardware.
 void dgtpicom_stop() {
 	// stop listening to broadcasts
-	*i2cSlaveSLV=16;
+	*i2cSlaveSLV=0x20/2;
 
 	// stop thread
 	dgtRx.on=0;
@@ -983,9 +997,9 @@ int dgt3000SetNRun(char srm[]) {
 void *dgt3000Receive(void *a) {
 	char rm[RECEIVE_BUFFER_LENGTH];
 	int e;
-	#ifdef debug2
+	//#ifdef debug2
 	int i;
-	#endif
+	//#endif
 
 	#ifdef debug
 	RECEIVE_THREAD_RUNNING_PIN_HI;
@@ -1105,13 +1119,29 @@ void *dgt3000Receive(void *a) {
 						printf("= Button: 0x%02x>0x%02x\n",rm[5]&0x7f,rm[4]&0x7f);
 						#endif
 						break;
-						#ifdef debug
+					case 0x20:
+						#ifdef debug2
+						printf("= Serial data\n");
+						#endif
+						for ( i=4; i < rm[2]-1; i++ )
+						{
+							smartBoardRXData[smartBoardRXHead++] = rm[i];
+							if ( smartBoardRXHead+1 == smartBoardRXTail )
+							{
+								#ifdef debug
+								printf("SmartBoard RX buffer full\n");
+								#endif
+								break;
+							}
+						}
+						break;
+					#ifdef debug
 					default:
 						ERROR_PIN_HI;
 						printf("%.3f ",(float)*timer/1000000);
 						printf("Receive Error: Unknown message from clock\n");
 						ERROR_PIN_LO;
-						#endif
+					#endif
 				}
 			} else  if (e<0) {
 				#ifdef debug2
@@ -1164,7 +1194,7 @@ int dgt3000GetAck(char adr, char cmd, long long int timeOut) {
 
 	// listen to given adress
 //	while ((*i2cSlaveFR&0x20) != 0 );
-	*i2cSlaveSLV=adr;
+	*i2cSlaveSLV=adr/2;
 
 	// check until timeout
 	timeOut+=*timer;
@@ -1180,7 +1210,7 @@ int dgt3000GetAck(char adr, char cmd, long long int timeOut) {
 	}
 
 	// listen for broadcast again
-	*i2cSlaveSLV=0x00;
+	//*i2cSlaveSLV=0x00;
 	pthread_mutex_unlock(&receiveMutex);
 
 	if (dgtRx.ack[0]==cmd)
@@ -1191,6 +1221,56 @@ int dgt3000GetAck(char adr, char cmd, long long int timeOut) {
 
 
 
+// send serial bytes over I2C to an e-Board 
+int smartBoardSend(char *data, char len)
+{
+	int i,e;
+	char d[128];
+	
+	d[0] = 0x14;	// dest board
+	d[1] = 0x20; 	// from pi
+	d[2] = len+5;	// size
+	d[3] = 0x20;	// cmd
+	for ( i=0; i<len; i++ )
+		d[i+4]=data[i];
+	crc_calc(d);
+	
+	char sendCount = 0;
+	while (1) {
+		sendCount++;
+		if (sendCount>3) {
+			#ifdef debug
+			ERROR_PIN_HI;
+			printf("%.3f ",(float)*timer/1000000);
+			printf("sending serial data failed three times on error%d\n\n",e);
+			ERROR_PIN_LO;
+			#endif
+			return e;
+		}
+
+		e=i2cSend(d,0x20);
+		// succes?
+		if (e==ERROR_OK)
+			return ERROR_OK;
+	}
+	
+	return 0;
+}
+
+// check buffer for bytes from an e-Board
+int smartBoardRead(char *data, int len)
+{
+	int i;
+	for (i=0; i<len; i++)
+	{
+		if ( smartBoardRXHead == smartBoardRXTail )
+			break;
+		data[i] = smartBoardRXData[smartBoardRXTail++];
+	}
+	return i;
+}
+
+ 
 
 // send message using I2CMaster
 int i2cSend(char message[], char ackAdr) {
@@ -1199,6 +1279,9 @@ int i2cSend(char message[], char ackAdr) {
 
 	// set length
 	*i2cMasterDLEN = message[2]-1;
+
+	// set to I2CMaster destination adress
+	*i2cMasterA=message[0]/2;
 
 	// clear buffer
 	*i2cMaster = 0x10;
@@ -1257,7 +1340,7 @@ int i2cSend(char message[], char ackAdr) {
 
 	// dont let the slave listen to 0 (wierd errors)?
 	// listen to ack adress
-	*i2cSlaveSLV = ackAdr;
+	*i2cSlaveSLV = ackAdr/2;
 
 	// start sending
 	*i2cMasterS = 0x302;
@@ -1269,7 +1352,7 @@ int i2cSend(char message[], char ackAdr) {
 		timeOut=*timer + 10000;   // should be done in 10ms
 		while((*i2cMasterS&0x10)==0) {
 			if (*i2cMasterS&2) {
-				*i2cSlaveSLV = 0x00;
+				//*i2cSlaveSLV = 0x00;
 				#ifdef debug
 				printf("%.3f ",(float)*timer/1000000);
 				printf("    Send error: done before complete send\n");
@@ -1277,7 +1360,7 @@ int i2cSend(char message[], char ackAdr) {
 				break;
 			}
 			if (*timer>timeOut) {
-				*i2cSlaveSLV = 0x00;
+				//*i2cSlaveSLV = 0x00;
 				#ifdef debug
 				printf("%.3f ",(float)*timer/1000000);
 				printf("    Send error: Buffer free timeout, waited more then 10ms for space in the buffer\n");
@@ -1299,7 +1382,7 @@ int i2cSend(char message[], char ackAdr) {
 	timeOut=*timer + 10000;   // should be done in 10ms
 	while ((*i2cMasterS&2)==0)
 		if (*timer>timeOut) {
-			*i2cSlaveSLV = 0x00;
+			//*i2cSlaveSLV = 0x00;
 			#ifdef debug
 			printf("%.3f ",(float)*timer/1000000);
 			printf("    Send error: done timeout, waited more then 10ms for message to be finished sending\n");
@@ -1313,7 +1396,7 @@ int i2cSend(char message[], char ackAdr) {
 		return ERROR_OK;
 	}
 
-	*i2cSlaveSLV = 0x00;
+	//*i2cSlaveSLV = 0x00;
 
 	// collision or clock off
 	if (*i2cMasterS&0x100) {
@@ -1361,8 +1444,8 @@ int i2cReceive(char m[]) {
 
 	m[0]=*i2cSlaveSLV*2;
 
-	// a message should be finished receiving in 10ms
-	timeOut=*timer+10000;
+	// a message should be finished receiving in 30ms
+	timeOut=*timer+30000;
 
 	#ifdef debug
 	if (bug.rxMaxBuf<(*i2cSlaveFR&0xf800)>>11)
@@ -1417,7 +1500,7 @@ int i2cReceive(char m[]) {
 	}
 
 	// listen for broadcast again
-	*i2cSlaveSLV=0x00;
+	//*i2cSlaveSLV=0x00;
 
 	m[i]=-1;
 
@@ -1430,7 +1513,7 @@ int i2cReceive(char m[]) {
 		return ERROR_OK;
 
 	// not from clock?
-	if (m[1]!=16) {
+	if (  (m[1]!=0x10)  && (m[1]!=0x14) ) {
 		#ifdef debug
 		ERROR_PIN_HI;
 		bug.rxWrongAdr++;
@@ -1537,7 +1620,7 @@ void i2cReset() {
 	// set i2c slave control register to enable: receive, i2c, device
 	*i2cSlaveCR = 0x205;
 	// set i2c slave address 0x00 to listen to broadcasts
-	*i2cSlaveSLV = 0x0;
+	*i2cSlaveSLV = 0x20/2;
 	// reset errors
 	*i2cSlaveRSR = 0;
 

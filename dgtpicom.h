@@ -119,6 +119,8 @@ int dgtpicom_off(char returnMode);
  */
 void dgtpicom_stop();
 
+int smartBoardSend(char *data, char len);
+int smartBoardRead(char *data, int len);
 
 /* return codes:
  *   -10= no direct access to memory, run as root
